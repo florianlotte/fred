@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+import asyncio
+import atexit
 import importlib
 import logging
 import os
@@ -48,9 +49,8 @@ from langchain_core.embeddings import Embeddings
 from neo4j import Driver, GraphDatabase
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from sentence_transformers import CrossEncoder
+from sqlalchemy.ext.asyncio import AsyncEngine
 
-# from fred_core.filesystem.local_filesystem import LocalFilesystem
-# from fred_core.filesystem.minio_filesystem import MinioFilesystem
 from knowledge_flow_backend.common.structures import (
     ChromaVectorStorageConfig,
     Configuration,
@@ -85,6 +85,8 @@ from knowledge_flow_backend.core.stores.resources.base_resource_store import Bas
 from knowledge_flow_backend.core.stores.resources.postgres_resource_store import PostgresResourceStore
 from knowledge_flow_backend.core.stores.tags.base_tag_store import BaseTagStore
 from knowledge_flow_backend.core.stores.tags.postgres_tag_store import PostgresTagStore
+from knowledge_flow_backend.core.stores.team_metadata.base_team_metadata_store import BaseTeamMetadataStore
+from knowledge_flow_backend.core.stores.team_metadata.postgres_team_metadata_store import PostgresTeamMetadataStore
 from knowledge_flow_backend.core.stores.vector.base_text_splitter import BaseTextSplitter
 from knowledge_flow_backend.core.stores.vector.base_vector_store import BaseVectorStore
 from knowledge_flow_backend.core.stores.vector.in_memory_langchain_vector_store import InMemoryLangchainVectorStore
@@ -260,6 +262,7 @@ class ApplicationContext:
     _vector_store_instance: Optional[BaseVectorStore] = None
     _metadata_store_instance: Optional[BaseMetadataStore] = None
     _tag_store_instance: Optional[BaseTagStore] = None
+    _team_metadata_store_instance: Optional[BaseTeamMetadataStore] = None
     _kpi_store_instance: Optional[BaseKPIStore] = None
     _log_store_instance: Optional[BaseLogStore] = None
     _opensearch_client: Optional[OpenSearch] = None
@@ -270,7 +273,7 @@ class ApplicationContext:
     _rebac_engine: Optional[RebacEngine] = None
     _neo4j_driver: Optional[Driver] = None
     _filesystem_instance: Optional[BaseFilesystem] = None
-    _async_engines: list[Any] = []
+    _pg_async_engine: Optional[AsyncEngine] = None
 
     def __init__(self, configuration: Configuration):
         # Allow reuse if already initialized with same config
@@ -433,6 +436,25 @@ class ApplicationContext:
         module = importlib.import_module(module_path)
         cls = getattr(module, class_name)
         return cls
+
+    def get_pg_async_engine(self):
+        """
+        Lazily create and cache a single async Postgres Engine for all the postgres async stores.
+        """
+        if self._pg_async_engine is None:
+            pg_cfg = self.configuration.storage.postgres
+            self._pg_async_engine = create_async_engine_from_config(pg_cfg)
+            engine = self._pg_async_engine
+
+            def _dispose_async_engine():
+                try:
+                    asyncio.run(engine.dispose())
+                except Exception:
+                    logger.debug("[SQL] Async engine dispose at exit failed", exc_info=True)
+
+            atexit.register(_dispose_async_engine)
+            logger.info("[SQL] Shared Postgres async initialized.")
+        return self._pg_async_engine
 
     def get_log_store(self) -> BaseLogStore:
         """
@@ -662,14 +684,11 @@ class ApplicationContext:
 
         store_config = get_configuration().storage.metadata_store
         if isinstance(store_config, PostgresTableConfig):
-            postgres_config = get_configuration().storage.postgres
-            engine = create_async_engine_from_config(postgres_config)
             self._metadata_store_instance = PostgresMetadataStore(
-                engine=engine,
+                engine=self.get_pg_async_engine(),
                 table_name=store_config.table,
                 prefix=store_config.prefix or "",
             )
-            self._async_engines.append(engine)
             return self._metadata_store_instance
         raise ValueError(f"Unsupported metadata storage backend type: {store_config.type}")
 
@@ -689,6 +708,18 @@ class ApplicationContext:
             connection_class=RequestsHttpConnection,
         )
         return self._opensearch_client
+
+    def get_async_sql_engine(self) -> AsyncEngine:
+        """Create one async SQL engine for the whole app"""
+        if self._pg_async_engine is None:
+            # For now, only Postgres is supported
+            pg = get_configuration().storage.postgres
+            if not pg:
+                raise ValueError("PostgreSQL configuration is required for async sql engine")
+
+            self._pg_async_engine = create_async_engine_from_config(pg)
+
+        return self._pg_async_engine
 
     def get_neo4j_driver(self) -> Driver:
         """
@@ -764,16 +795,25 @@ class ApplicationContext:
 
         store_config = get_configuration().storage.tag_store
         if isinstance(store_config, PostgresTableConfig):
-            pg = get_configuration().storage.postgres
-            engine = create_async_engine_from_config(pg)
             self._tag_store_instance = PostgresTagStore(
-                engine=engine,
+                engine=self.get_pg_async_engine(),
                 table_name=store_config.table,
                 prefix=store_config.prefix or "",
             )
-            self._async_engines.append(engine)
             return self._tag_store_instance
         raise ValueError(f"Unsupported tag storage backend: {store_config.type}")
+
+    def get_team_metadata_store(self) -> BaseTeamMetadataStore:
+        """Get the team metadata store instance."""
+        # No choice, team store only support SQLAlchemy compatible db (Postgres, SQLite...)
+        if self._team_metadata_store_instance is not None:
+            return self._team_metadata_store_instance
+        pg = get_configuration().storage.postgres
+        engine = create_async_engine_from_config(pg)
+        self._team_metadata_store_instance = PostgresTeamMetadataStore(engine=engine)
+        return self._team_metadata_store_instance
+
+        # return PostgresTeamMetadataStore(engine=self.get_async_sql_engine())
 
     def get_resource_store(self) -> BaseResourceStore:
         if self._resource_store_instance is not None:
@@ -781,14 +821,11 @@ class ApplicationContext:
 
         store_config = get_configuration().storage.resource_store
         if isinstance(store_config, PostgresTableConfig):
-            pg = get_configuration().storage.postgres
-            engine = create_async_engine_from_config(pg)
             self._resource_store_instance = PostgresResourceStore(
-                engine=engine,
+                engine=self.get_pg_async_engine(),
                 table_name=store_config.table,
                 prefix=store_config.prefix or "",
             )
-            self._async_engines.append(engine)
             return self._resource_store_instance
         raise ValueError(f"Unsupported tag storage backend: {store_config.type}")
 
@@ -1121,6 +1158,13 @@ class ApplicationContext:
         except Exception:
             logger.debug("[HTTP] Failed to shutdown shared clients", exc_info=True)
 
+        # Async PG engine
+        if self._pg_async_engine is not None:
+            try:
+                await self._pg_async_engine.dispose()
+            finally:
+                self._pg_async_engine = None
+
         # OpenSearch client
         if self._opensearch_client is not None:
             try:
@@ -1138,11 +1182,3 @@ class ApplicationContext:
                 logger.debug("[NEO4J] Error closing driver", exc_info=True)
             finally:
                 self._neo4j_driver = None
-
-        # Async SQLAlchemy engines created here
-        for engine in self._async_engines:
-            try:
-                await engine.dispose()
-            except Exception:
-                logger.debug("[DB] Error disposing async engine", exc_info=True)
-        self._async_engines.clear()

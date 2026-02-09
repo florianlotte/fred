@@ -497,11 +497,12 @@ class ApplicationContext:
 
         store_config = get_configuration().storage.session_store
         if isinstance(store_config, PostgresTableConfig):
-            return PostgresSessionStore(
+            self._session_store_instance = PostgresSessionStore(
                 engine=self.get_pg_async_engine(),
                 table_name=store_config.table,
                 prefix=store_config.prefix or "",
             )
+            return self._session_store_instance
         raise ValueError("Unsupported sessions storage backend (async-only)")
 
     def get_session_attachment_store(self) -> Optional[BaseSessionAttachmentStore]:
