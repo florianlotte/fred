@@ -826,8 +826,6 @@ class ApplicationContext:
         self._team_metadata_store_instance = PostgresTeamMetadataStore(engine=engine)
         return self._team_metadata_store_instance
 
-        # return PostgresTeamMetadataStore(engine=self.get_async_sql_engine())
-
     def get_resource_store(self) -> BaseResourceStore:
         if self._resource_store_instance is not None:
             return self._resource_store_instance
